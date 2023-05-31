@@ -8,16 +8,18 @@ import re
 EXAMPLE = """#[account]
 pub struct MyData {
     pub val: u16,
+    pub is_cool: bool,
     pub state: GameState,
+    pub van : [f64; 5],
+    pub maybe: Option<i128>
     pub players: Vec<Pubkey> // we want to support up to 10 players
 }
-
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
 pub enum GameState {
     Active,
     Tie,
-    Won { winner: Pubkey },
+    Won { winner: Pubkey, score: i128 },
 }
 """
 
@@ -53,7 +55,25 @@ DEFAULT_SIZE_MAP = {
 
 DEFAULT_VEC = 10
 DEFAULT_STR = 1
+# Helper function to split variants correctly
+def split_variants(text):
+    variants = []
+    depth = 0
+    start = 0
 
+    for i, c in enumerate(text):
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            variants.append(text[start:i].strip())
+            start = i + 1
+
+    # Append last item
+    variants.append(text[start:].strip())
+
+    return variants
 class WarningContainer:
     def warning(self, message):
         print("Warning: " + message)
@@ -77,6 +97,8 @@ def calculate_struct_size(text, warning_cont, size_map=DEFAULT_SIZE_MAP, session
     sections.sort(key=lambda x: {'pub enum': 1, 'pub struct': 2, 'impl': 3}[x[0].lower()])
 
 
+
+
     for identifier, section in sections:
         section = identifier.lower() + section
         if 'impl' in section:
@@ -86,18 +108,44 @@ def calculate_struct_size(text, warning_cont, size_map=DEFAULT_SIZE_MAP, session
         if 'pub enum' in section:
             enum_name, enum_body = re.search(r'pub enum (.*?) {([^}]*)}', section, re.DOTALL).groups()
             enum_name = enum_name.strip()
-            enum_variants = enum_body.strip().split(',')
+
+            enum_variants = split_variants(enum_body.strip())
+            
             enum_size = 1  # Minimum size of an enum is 1 for the discriminant
             enum_calc_str = "1"  # 1 for the discriminant
+
             for variant in enum_variants:
+                variant = variant.strip()
                 if '{' in variant:
-                    variant_type = variant.split('{')[1].split(':')[1].strip(' }')
-                    enum_size = max(enum_size, 1 + size_map[variant_type.lower()])
-                    enum_calc_str = "1 + " + variant_type.lower()
+                    variant_name, variant_fields = variant.split('{', 1)
+                    variant_fields = variant_fields.rsplit('}', 1)[0].split(',')
+
+                    variant_size = 0
+                    variant_calc_str = []
+                    for field in variant_fields:
+                        field_name, field_type = field.split(':')
+                        field_type = field_type.strip()
+                        variant_size += size_map[field_type.lower()]
+                        variant_calc_str.append(field_type.lower())
+
+                    enum_size = max(enum_size, 1 + variant_size)
+                    enum_calc_str = f"1 + {' + '.join(variant_calc_str)}"
+
             enum_sizes[enum_name.lower()] = (enum_size, enum_calc_str)
-        
+                
         # Parse the struct and find all lines that define a variable
         elif 'pub struct' in section:
+
+            def safe_get_size(base_type):
+                this_size_0 = 0
+                if base_type.lower() in size_map:
+                    this_size_0 = size_map.get(base_type.lower(), 0)
+                elif base_type.lower() in enum_sizes:
+                    this_size_0 = enum_sizes[base_type.lower()][0]
+                else:
+                    warning_cont.error('ERROR: no type "`' +  base_type + '`" in map (for "`'+str(line)+'`")')
+                return this_size_0
+            
             struct_calc_strs = []
 
             lines = section.split("\n")
@@ -126,7 +174,8 @@ def calculate_struct_size(text, warning_cont, size_map=DEFAULT_SIZE_MAP, session
                     comments_strs.append(f"+ {this_size} // {parts[0]}: {type_str}")
                 elif type_str.lower().startswith("option<"):
                     base_type = re.search(r'option<(.*?)>', type_str, re.IGNORECASE).group(1)
-                    this_size = 1 + size_map[base_type.lower()]
+                    this_size_0 = safe_get_size(base_type)
+                    this_size = 1 + this_size_0
                     struct_size += this_size
                     struct_calc_strs.append("1 + {}".format(base_type.lower()))
                     comments_strs.append(f"+ {this_size} // {parts[0]}: {type_str}")
@@ -139,7 +188,8 @@ def calculate_struct_size(text, warning_cont, size_map=DEFAULT_SIZE_MAP, session
                     match = re.search(r'\[(.*?);(.*?)\]', type_str)
                     base_type = match.group(1)
                     amount = int(match.group(2))
-                    this_size = size_map[base_type.lower()] * amount
+                    this_size_0 = safe_get_size(base_type)
+                    this_size = this_size_0  * amount
                     struct_size += this_size
                     struct_calc_strs.append("{} * {}".format(base_type.lower(), amount))
                     comments_strs.append(f"+ {this_size} // {parts[0]}: {type_str}")
